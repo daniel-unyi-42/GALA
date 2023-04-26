@@ -1,158 +1,109 @@
-import tensorflow as tf
-from scipy import sparse
+import torch
+from torch import Tensor
+from torch.utils.tensorboard import SummaryWriter
+from torch import nn
+import torch.nn.functional as F
+import torch_geometric.nn as pyg_nn
+from torch_geometric.datasets import Planetoid
+from sklearn.cluster import KMeans, SpectralClustering
+from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
+import gcn_deconv
 
-def extract_data(filename):
-  import numpy as np
-  # load data
-  data = np.load(filename)
-  adj = sparse.csr_matrix((data['adj_data'], data['adj_indices'], data['adj_indptr']), \
-                                       shape=data['adj_shape'], dtype='float32')
-  attr = sparse.csr_matrix((data['attr_data'], data['attr_indices'], data['attr_indptr']), \
-                                     shape=data['attr_shape'], dtype='float32')
-  N = len(data['labels'])
-  N_classes = len(set(data['labels']))
-  labels = sparse.csr_matrix((np.ones(N), data['labels'], np.arange(N + 1)), \
-                             shape=(N, N_classes), dtype='float32')
-  # symmetrize
-  adj = adj.tolil()
-  rows, cols = adj.nonzero()
-  adj[cols, rows] = adj[rows, cols]
-  # shuffle
-  permutation = list(range(N))
-  #np.random.shuffle(permutation)
-  adj = adj.tocoo()
-  for i in range(adj.nnz):
-    adj.row[i] = permutation[adj.row[i]]
-    adj.col[i] = permutation[adj.col[i]]
-  attr = attr.tocoo()
-  for i in range(attr.nnz):
-    attr.row[i] = permutation[attr.row[i]]
-  labels = labels.tocoo()
-  for i in range(labels.nnz):
-    labels.row[i] = permutation[labels.row[i]]
-  # result
-  return adj.tocsr(), attr.todense(), labels.todense()
 
-filename = 'cora.npz'
+writer = SummaryWriter(log_dir='runs/GALA')
 
-# hyperparameters
-hidden = 64
-latent = 32
-learning_rate = 0.01
+EPS = 1e-15
+
+lr = 0.0001
 epochs = 1000
 
-adjacency, features, labels = extract_data(filename)
 
-features = tf.math.l2_normalize(tf.constant(features), axis=1)
-labels = tf.math.l2_normalize(tf.constant(labels), axis=1)
-N, F = features.shape
+class Encoder(nn.Module):
+    def __init__(self, num_features):
+        super().__init__()
+        self.conv1 = pyg_nn.GCNConv(num_features, 1600, cached=True)
+        self.conv2 = pyg_nn.GCNConv(1600, 400, cached=True)
 
-# renormalization
-smoother = sparse.eye(N, dtype='float32') + adjacency
-degrees = sparse.eye(N, dtype='float32') + sparse.diags(adjacency.sum(axis=1).A1)
-norm = degrees.power(-0.5)
-smoother = norm * smoother * norm  # D**-1/2 * W * D**-1/2
-
-# sparse.csr_matrix -> tf.SparseTensor
-indices = list(zip(smoother.tocoo().row, smoother.tocoo().col))
-values = smoother.data
-dense_shape = smoother.shape
-smoother = tf.SparseTensor(indices, values, dense_shape)
-
-# renormalization
-sharpener = 2.0 * sparse.eye(N, dtype='float32') - adjacency
-degrees = 2.0 * sparse.eye(N, dtype='float32') + sparse.diags(adjacency.sum(axis=1).A1)
-norm = degrees.power(-0.5)
-sharpener = norm * sharpener * norm  # D**-1/2 * W * D**-1/2
-
-# sparse.csr_matrix -> tf.SparseTensor
-indices = list(zip(sharpener.tocoo().row, sharpener.tocoo().col))
-values = sharpener.data
-dense_shape = sharpener.shape
-sharpener = tf.SparseTensor(indices, values, dense_shape)
-
-# layer classes
-
-class ReLU_layer:
-
-  def __call__(self, tensor):
-    return tf.nn.relu(tensor)
-
-class GC_layer:
-
-  def __init__(self, indim, outdim):
-    initial_value = tf.initializers.he_normal()((indim, outdim,))
-    self.weight = tf.Variable(initial_value=initial_value, trainable=True)
-
-  def __call__(self, tensor, support):
-    return tf.sparse.sparse_dense_matmul(support, tf.linalg.matmul(tensor, self.weight))
-
-# model class
-
-class Model:
-
-  def __init__(self, size_tuple, optimizer):
-    self.build(size_tuple)
-    self.optimizer = optimizer
-
-  def build(self, size_tuple):
-    F, hidden, latent = size_tuple
-    self.encoder0 = GC_layer(F, hidden)
-    self.encoder1 = GC_layer(hidden, latent)
-    self.decoder1 = GC_layer(latent, hidden)
-    self.decoder0 = GC_layer(hidden, F)
-
-  def predict(self, tensor, smoother, sharpener):
-    tensor = self.encode(tensor, smoother)
-    tensor = ReLU_layer()(tensor)
-    tensor = self.decode(tensor, sharpener)
-    return tensor
-
-  def encode(self, tensor, support):
-    tensor = self.encoder0(tensor, support)
-    tensor = ReLU_layer()(tensor)
-    tensor = self.encoder1(tensor, support)
-    return tensor
-
-  def decode(self, tensor, support):
-    tensor = self.decoder1(tensor, support)
-    tensor = ReLU_layer()(tensor)
-    tensor = self.decoder0(tensor, support)
-    return tensor
-
-  def train(self, features, smoother, sharpener, epochs):
-    sources = (self.encoder0.weight, self.encoder1.weight, self.decoder1.weight, self.decoder0.weight)
-    for epoch in range(epochs):
-      with tf.GradientTape() as tape:
-        predictions = self.predict(features, smoother, sharpener)
-        loss_ = self.loss(predictions, features)
-      grads = tape.gradient(loss_, sources)
-      self.optimizer.apply_gradients(zip(grads, sources))
-      print('%d epoch: loss = %f' % (epoch, loss_.numpy()))
-
-  def loss(self, predictions, features):
-    return tf.reduce_sum(tf.square(features - predictions))/2/features.shape[0]
-
-size_tuple = (F, hidden, latent)
-optimizer = tf.optimizers.Adam(learning_rate=learning_rate)
-
-model = Model(size_tuple, optimizer)
-
-model.train(features, smoother, sharpener, epochs)
-
-embeddings = model.encode(features, smoother)
+    def forward(self, x, edge_index):
+        x = F.relu(self.conv1(x, edge_index))
+        x = self.conv2(x, edge_index)
+        return x
 
 
+class Decoder(nn.Module):
+      def __init__(self, num_features):
+          super().__init__()
+          self.conv1 = gcn_deconv.GCNDeconv(400, 1600, improved=True, cached=True)
+          self.conv2 = gcn_deconv.GCNDeconv(1600, num_features, improved=True, cached=True)
+
+      def forward(self, x, edge_index):
+          x = F.relu(self.conv1(x, edge_index))
+          x = self.conv2(x, edge_index)
+          return x
 
 
-import umap
-reducer = umap.UMAP(random_state=42)
-embedding = reducer.fit_transform(embeddings.numpy())
+class GAE(nn.Module):
+    def __init__(self, num_features):
+        super().__init__()
+        self.encoder = Encoder(num_features)
+        self.decoder = Decoder(num_features)
+        GAE.reset_parameters(self)
 
-import matplotlib.pyplot as plt
-fig, ax = plt.subplots(figsize=(12, 12))
-color = tf.argmax(labels, axis=1).numpy()
-plt.scatter(embedding[:, 0], embedding[:, 1], c=color, cmap="Spectral", s=10)
-plt.setp(ax, xticks=[], yticks=[])
-plt.title("UMAP", fontsize=18)
-plt.show()
+    def reset_parameters(self):
+        pyg_nn.inits.reset(self.encoder)
+        pyg_nn.inits.reset(self.decoder)
+
+    def forward(self, x, edge_index):
+        return self.encoder(x, edge_index)
+
+    def encode(self, x, edge_index):
+        return self.encoder(x, edge_index)
+
+    def decode(self, x, edge_index):
+        return self.decoder(x, edge_index)
+
+    def loss(self, x, edge_index):
+        z = self.encode(x, edge_index)
+        x_hat = self.decode(z, edge_index)
+        return torch.square(torch.norm(x - x_hat)) / 2 / x.shape[0]
+    
+    # test node clustering
+    def test_NC(self, z, y):
+        kmeans = KMeans(n_clusters=7, n_init=20)
+        y_pred = kmeans.fit_predict(z.detach().cpu().numpy())
+        y_true = y.detach().cpu().numpy()
+        return normalized_mutual_info_score(y_true, y_pred), \
+            adjusted_rand_score(y_true, y_pred)
+
+
+device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+
+dataset = Planetoid(root='', name='Cora')
+
+data = dataset[0].to(device)
+
+model = GAE(dataset.num_features).to(device)
+
+print(model)
+
+print('%d parameters' % sum(p.numel() for p in model.parameters() if p.requires_grad))
+
+optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+for epoch in range(epochs):
+    model.train()
+    optimizer.zero_grad()
+    loss_value = model.loss(data.x, data.edge_index)
+    loss_value.backward()
+    optimizer.step()
+    model.eval()
+    with torch.no_grad():
+        z = model.encode(data.x, data.edge_index)
+        nmi, ari = model.test_NC(z, data.y)
+        writer.add_scalar("loss", loss_value, global_step=epoch)
+        writer.add_scalar("nmi", nmi, global_step=epoch)
+        writer.add_scalar("ari", ari, global_step=epoch)
+        print(f'Epoch: {epoch:03d}, Loss: {loss_value.float():.4f}, NMI: {nmi:.4f}', f'ARI: {ari:.4f}')
+
+writer.flush()
+writer.close()
