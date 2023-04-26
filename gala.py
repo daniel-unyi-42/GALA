@@ -4,6 +4,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch import nn
 import torch.nn.functional as F
 import torch_geometric.nn as pyg_nn
+from torch_geometric.utils import negative_sampling
 from torch_geometric.datasets import Planetoid
 from sklearn.cluster import KMeans, SpectralClustering
 from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
@@ -61,11 +62,25 @@ class GAE(nn.Module):
 
     def decode(self, x, edge_index):
         return self.decoder(x, edge_index)
+    
+    def adjrec(self, z, edge_index, sigmoid=True):
+        value = (z[edge_index[0]] * z[edge_index[1]]).sum(dim=1)
+        return torch.sigmoid(value) if sigmoid else value
+
+    def adj_loss(self, z, pos_edge_index, neg_edge_index = None):
+        pos_loss = -torch.log(self.adjrec(z, pos_edge_index) + EPS).mean()
+        if neg_edge_index is None:
+            neg_edge_index = negative_sampling(pos_edge_index, z.size(0))
+        neg_loss = -torch.log(1 - self.adjrec(z, neg_edge_index, sigmoid=True) + EPS).mean()
+        return pos_loss + neg_loss
+    
+    def x_loss(self, x, x_hat):
+        return torch.square(torch.norm(x - x_hat)) / 2 / x.shape[0]
 
     def loss(self, x, edge_index):
         z = self.encode(x, edge_index)
         x_hat = self.decode(z, edge_index)
-        return torch.square(torch.norm(x - x_hat)) / 2 / x.shape[0]
+        return self.x_loss(x, x_hat) + self.adj_loss(z, edge_index)
     
     # test node clustering
     def test_NC(self, z, y):
